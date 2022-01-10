@@ -1,0 +1,258 @@
+---
+title: Testing differences in results and time between neighborhood analysis in R
+  and GRASS
+author: "Bernardo Niebuhr"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      dpi = 300)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+Here we'll test the differences between different approaches to make filters and calculate densities in both R and
+GRASS GIS. In GRASS, we'll calculate densities using two different modules, `r.neighbors` and
+`r.resamp.filter` to check the difference in their outputs, both qualitatively and in terms of time spent
+in the calculations.
+
+After that, we'll also perform neighborhood analysis in R using the `focal` function of the `terra` package and
+compare the computation time with the GRASS GIS approaches.
+
+We'll first look at the qualitative differences in a small region, then we perform the operations for the whole
+Norway for comparing computation time.
+
+## Set environment
+
+I'll work in my personal mapset in the "ETRS_33N" GRASS GIS location, copying a map of forest amount from NORUT and
+calculating densities based on it.
+
+```{r settings, results="hide", message=FALSE, warning=FALSE}
+# libraries
+library(rgrass7)
+library(raster)
+library(terra)
+library(NinaR)
+
+library(dplyr)
+
+library(microbenchmark)
+library(tictoc)
+library(viridis)
+```
+
+Connect to GRASS.
+
+```{r connect2GRASS}
+# should we run the heavy tests?
+heavy_test <- TRUE
+
+# start GRASS and connect to my mapset
+grassdir <- system("grass78 --config path", intern = T)
+gisDB <- "/data/grass"
+loc <- "ETRS_33N/"
+ms <- "u_bernardo.brandao"
+
+# initGRASS(gisBase = grassdir,
+#           home = tempdir(), 
+#           override = T,
+#           gisDbase = gisDB,
+#           location = loc, 
+#           mapset = ms)
+
+# more directly within NINA
+NinaR::grassConnect(mapset = ms)
+```
+
+```{r}
+# system("export GRASS_MESSAGE_FORMAT=silent")
+stringexecGRASS("g.gisenv set='GRASS_MESSAGE_FORMAT=silent'") 
+```
+
+Prepare the input maps in both GRASS and R and visualize them.
+
+```{r prepare_input}
+# copy map of forests from NORUT
+
+# check region
+gmeta() # g.copy is not affected by the region
+
+# copy
+# execGRASS("g.copy", flags = "help")
+execGRASS("g.copy", parameters = list(raster = "norut_skog_100@p_RenRein_norut,norut_skog_100"),
+          flags = c("overwrite"))
+
+# define region
+# I defined a region_test through the GRASS GUI and using v.in.region output=region_test
+# execGRASS("g.copy", parameters = list(vector = "region_test@u_bernardo.brandao2,region_test"))
+# then I removed the vector from the other mapset
+execGRASS("g.region", parameters = list(vector = "region_test", align = "norut_skog_100"),
+          flags = "p")
+
+# create a new small map for the current region, just to ease visualization in R
+execGRASS("r.mapcalc", expression = "norut_skog_100_sub = norut_skog_100",
+          flags = c("overwrite", "quiet"))
+
+# show input map and region here
+use_sp()
+forest <- readRAST(c("norut_skog_100_sub"))
+
+# as a SpatialGridDataFrame
+image(forest, "norut_skog_100_sub", col = viridis(20))
+
+# raster
+r <- raster::raster(forest)
+# raster::plot(r)
+# terra
+r2 <- terra::rast(r)
+plot(r2)
+```
+
+## Test1: within GRASS, the difference between `r.neighbors` and `r.resamp.filter`
+
+Here we start by comparing qualitatively the results of the two GRASS GIS modules for the 
+small test region..
+
+```{r test1_grass, warning=FALSE, message = FALSE}
+# r.resamp.filter
+# execGRASS("r.resamp.filter", flags = "help")
+
+tic()
+execGRASS("r.resamp.filter",
+          parameters = list(input = "norut_skog_100_sub", output = "test1_resamp_filter_500",
+                            filter = "bartlett", radius = 500),
+          flags = c("overwrite", "quiet"))
+toc()
+
+# r.neighbors
+# execGRASS("r.neighbors", flags = "help")
+
+tic()
+execGRASS("r.neighbors",
+          parameters = list(input = "norut_skog_100_sub", output = "test1_neighbors_500",
+                            method = "average", size = 9),
+          flags = c("c", "overwrite", "quiet"))
+toc()
+
+# show output
+g1 <- readRAST(c("test1_resamp_filter_500", "test1_neighbors_500"))
+
+# to SpatRaster
+g1_1 <-  raster::raster(g1) %>% 
+  raster::stack(raster(g1, layer = 2)) %>% 
+  terra::rast()
+
+plot(g1_1)
+```
+
+From the plot, the results seem quite similar. Indeed, the mean, median, and 1st/4th quantiles are close to each other. However, they differ locally in their values, differences of up to .1 (for a quantity in the interval [0, 1]), in this case with average `as.numeric(global(g1_1[[1]], "mean"))`. Most probably this is due to different algorithms for filtering and averaging.
+
+```{r}
+# Summary statistics
+summary(g1_1)
+
+# Plot difference
+# plot(diff(g1_1)/g1_1[[1]], main = "Difference of outputs r.resamp.filter - r.neighbors")
+plot(diff(g1_1), main = "Difference of outputs r.resamp.filter - r.neighbors")
+```
+
+## Test2: qualitative comparison of GRASS vs R neighborhood operations
+
+Now we do the same including an R implementation for neighborhood analysis, with the `terra` package.
+
+```{r}
+# ?terra::focal
+
+tic()
+terra_focal <- focal(r2, w = 9, fun = "mean")
+toc()
+names(terra_focal) <- "focal_500"
+
+# merge outputs
+g2 <- c(g1_1, terra_focal)
+
+# Plot
+plot(g2)
+
+# Summary statistics
+summary(g2)
+
+# Plot difference
+# plot(diff(g1_1)/g1_1[[1]], main = "Difference of outputs r.resamp.filter - r.neighbors")
+plot(diff(g2[[c(1,3)]]), main = "Difference of outputs r.resamp.filter - focal")
+```
+
+Again the outputs are similar, but there are local differences.
+
+## Test3: computation time in GRASS vs R operations
+ 
+Now we use the microbenchmark function to compare the computation time between each approach,
+first for a small area, then using bigger window sizes, and finally for the whole Norway.
+
+```{r}
+# ?microbenchmark
+# defining function bna = benchmark for neighborhood analysis
+source("code/functions.R")
+
+# Parameters
+input_map_grass <- "norut_skog_100_sub"
+input_map_r <- r2
+
+# Window size
+size_m = 500
+size_pixels = 2*size_m/100 - 1#9
+
+(bm1 <- bna(input_map_grass, input_map_r, size_m, size_pixels))
+```
+
+Here, interestingly, R is faster than GRASS.
+
+Now we change the window size to something bigger - let's use 2500m (or 49 pixels).
+
+```{r}
+# Window size
+size_m = 2500
+size_pixels = 2*size_m/100 - 1
+
+(bm2 <- bna(input_map_grass, input_map_r, size_m, size_pixels, times = 10))
+```
+
+Here the picture is different. `r.resamp.filter` is much faster, and `r.neighbors` and `focal` have comparable computation times. This keeps the picture in the tests below.
+
+We can take even bigger window size - let's use 10,000m (or 199 pixels).
+
+```{r}
+# Window size
+size_m = 10000
+size_pixels = 2*size_m/100 - 1
+
+if(heavy_test) (bm3 <- bna(input_map_grass, input_map_r, size_m, size_pixels, times = 10))
+```
+
+Now we run for the whole country, but only once, just to have an idea.
+Let's keep an intermediate scale for the window size, 2500m, for that test.
+
+```{r}
+# Region
+execGRASS("g.region", parameters = list(raster = "norut_skog_100"),
+          flags = "p")
+
+# Input as SpatRaster
+skog <- readRAST("norut_skog_100") %>% 
+  raster::raster() %>% 
+  terra::rast()
+
+# input map
+input_map_grass <- "norut_skog_100"
+input_map_r <- skog
+
+# Window size
+size_m = 2500
+size_pixels = 2*size_m/100 - 1#9
+
+if(heavy_test) (bm4 <- bna(input_map_grass, input_map_r, size_m, size_pixels, times = 1))
+```
+
